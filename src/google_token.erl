@@ -27,9 +27,6 @@
   code_change/3
 ]).
 
--record(state, {keys = [], error = unknown_error}).
-
-
 %% ----------------------------------------------------------------------------
 %% External functions
 %% ----------------------------------------------------------------------------
@@ -46,7 +43,20 @@ start_link() ->
 -spec validate(binary()) -> {valid, map()} | {invalid, term()}.
 %% @doc Validates the ID token
 validate(IdToken) ->
-  gen_server:call(?MODULE, {verify_without_ids, IdToken}).
+  [{certs, #{exp_at => Date, certs => Certs}}] = ets:lookup(google_token_cache, certs),
+  case Date > now_todo of
+    false ->
+      do_verify(IdToken, Certs);
+    true ->
+      ok = refresh_certs(),
+      [{certs, #{exp_at => RefreshedDate, certs => RefreshedCerts}}] =
+        ets:lookup(google_token_cache, certs),
+      do_verify(IdToken, RefreshedCerts),
+      ok
+  end.
+
+refresh_certs() ->
+  gen_server:call(?MODULE, refresh).
 
 -spec validate(binary(), list()) -> {valid, map()} | {invalid, term()}.
 %% @doc Validates the ID token and it's aud against the client IDs specified
@@ -59,10 +69,21 @@ validate(IdToken, ClientIds) ->
 
 %% @private
 init(_Args) ->
-  {state, State} = get_cert_state(),
-  {ok, State}.
+  %%{state, State} = get_cert_state(),
+  ets:new(google_token_cache, [set, public, named_table, {read_concurrency, true}]),
+  {ok, #{exp_at => 0}}.
 
 %% @private
+handle_call(refresh, _From, #{exp_at := ExpAt} = State) ->
+  case ExpAt > now_todo of
+    true -> {reply, ok, State};
+    false ->
+      CertsResponse = get_certs(), %% #{exp_at => Date, certs => Certs}
+      #{exp_at => ExpAt} = CertsResponse,
+      ets:insert(google_token_cache, Certs),
+      {reply, ok, #{exp_at => ExpAt}}
+  end.
+
 handle_call({verify_without_ids, IdToken}, _From, State) ->
   Reply = do_verify(IdToken, State),
   {reply, Reply, State};
@@ -71,7 +92,7 @@ handle_call({verify_with_ids, [IdToken, ClientIds]}, _From, State) ->
     {valid, Payload} ->
       check_audience(Payload, ClientIds);
     Error ->
-      Error 
+      Error
   end,
   {reply, Reply, State};
 handle_call(_Request, _From, State) ->
@@ -97,8 +118,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %% ----------------------------------------------------------------------------
 
--spec do_verify(binary(), #state{}) -> {valid, map()} | 
-                                       {invalid, term()} | 
+-spec do_verify(binary(), #state{}) -> {valid, map()} |
+                                       {invalid, term()} |
                                        {error, term()}.
 %% @private
 %% @doc Abstracts the JWT validation
@@ -127,9 +148,9 @@ get_kid(IdToken) ->
       {error, not_found}
   end.
 
--spec try_verify(binary(), binary(), #state{}, list(), boolean()) -> 
-                                                        {valid, map()} | 
-                                                        {invalid, term()} | 
+-spec try_verify(binary(), binary(), #state{}, list(), boolean()) ->
+                                                        {valid, map()} |
+                                                        {invalid, term()} |
                                                         {error, term()}.
 %% @private
 %% @doc Performs error checking and key matching
@@ -146,14 +167,14 @@ try_verify(IdToken, KId, State, Keys, Retried) ->
     _Error when Retried =:= false ->
       try_verify(IdToken, KId, State, [], false);
     _Error ->
-      {invalid, no_verifier} 
+      {invalid, no_verifier}
   end.
 
 -spec validate_jwt(map(), binary()) -> {valid, map()} | {invalid, term()}.
 %% @private
 %% @doc Does the actual validation of JWT using given JWK
 validate_jwt(Key, JWT) ->
-  JWK = jose_jwk:from_map(Key), 
+  JWK = jose_jwk:from_map(Key),
   case jose_jwt:verify(JWK, JWT) of
     {true, {jose_jwt, Payload}, _JWS} ->
       validate_claims(Payload);
@@ -165,7 +186,7 @@ validate_jwt(Key, JWT) ->
 %% @private
 %% @doc Validate expiry and issuer claims
 validate_claims(Payload) ->
-  Expiry = maps:get(<<"exp">>, Payload, 0), 
+  Expiry = maps:get(<<"exp">>, Payload, 0),
   Now    = erlang:round(erlang:system_time() / 1000000000),
   if
     Now < Expiry ->
@@ -173,25 +194,25 @@ validate_claims(Payload) ->
     true ->
       {invalid, expired}
   end.
-  
--spec check_issuer(map()) -> {valid, map()} | {invalid, term()}. 
+
+-spec check_issuer(map()) -> {valid, map()} | {invalid, term()}.
 %% @private
 %% @doc Check iss and match with Google's known iss
 check_issuer(Payload) ->
-  Issuer = maps:get(<<"iss">>, Payload, <<>>), 
+  Issuer = maps:get(<<"iss">>, Payload, <<>>),
   if
     Issuer =:= <<"accounts.google.com">> orelse
     Issuer =:= <<"https://accounts.google.com">> ->
       {valid, Payload};
     true ->
-      {invalid, wrong_iss} 
+      {invalid, wrong_iss}
   end.
 
 -spec check_audience(map(), list()) -> {valid, map()} | {invalid, term()}.
 %% @private
 %% @doc Check aud claim and match with given ids
 check_audience(Payload, Ids) ->
-  Audience = maps:get(<<"aud">>, Payload, <<>>), 
+  Audience = maps:get(<<"aud">>, Payload, <<>>),
   Found = lists:foldl(fun(Id, Found) ->
     BinId = ensure_binary(Id),
     Found orelse Audience =:= BinId
@@ -202,10 +223,10 @@ check_audience(Payload, Ids) ->
     true ->
       {invalid, wrong_aud}
   end.
-    
+
 
 -spec find_key(binary(), list()) -> {key, map()} | {error, not_found}.
-%% @private 
+%% @private
 %% @doc Search Google's key / cert list for kid
 find_key(KId, Keys) ->
   find_key(KId, Keys, no_match).
@@ -222,7 +243,7 @@ find_key(KId, [Key | Keys], no_match) ->
       no_match
   end,
   find_key(KId, Keys, Res).
-        
+
 -spec get_cert_state() -> {state, #state{}}.
 %% @private
 %% @doc Performs get_certs() and returns the state
@@ -233,7 +254,7 @@ get_cert_state() ->
     Error ->
       {state, #state{error = Error}}
   end.
-  
+
 -spec get_certs() -> {certs, list()}.
 %% @private
 %% @doc Gets the latest JWK from Google's certificate repository
@@ -259,3 +280,9 @@ ensure_binary(Term) when is_list(Term) ->
   list_to_binary(Term);
 ensure_binary(Term) when is_atom(Term) ->
   atom_to_binary(Term, utf8).
+
+%%%_* Emacs ============================================================
+%%% Local Variables:
+%%% allout-layout: t
+%%% erlang-indent-level: 2
+%%% End:

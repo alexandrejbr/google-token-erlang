@@ -15,13 +15,14 @@ start_link() ->
   supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 init([]) ->
-  {ok, {{one_for_one, 1000, 1}, [
-    {
-      google_token,
-      {google_token, start_link, []},
-      permanent,
-      5000,
-      worker,
-      [google_token]
-    }
-  ]}}.
+  SupFlags = #{strategy => one_for_one, intensity => 1000, period => 1},
+
+  ChildSpecs = [#{id => google_token,
+                 start => {google_token, start_link, []},
+                 restart => permanent,
+                 shutdown => 5000,
+                 type => worker,
+                 modules => [google_token]
+                }
+               ],
+  {ok, {SupFlags, ChildSpecs}}.
