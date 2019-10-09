@@ -7,25 +7,25 @@
 -behaviour(gen_server).
 
 %% API
--export([
-  validate/1,
-  validate/2
-]).
+-export([validate/1,
+         validate/2
+        ]).
 
 %% External functions
--export([
-  start_link/0
-]).
+-export([start_link/0]).
 
 %% gen_server callbacks
--export([
-  init/1,
-  handle_call/3,
-  handle_cast/2,
-  handle_info/2,
-  terminate/2,
-  code_change/3
-]).
+-export([init/1,
+         handle_call/3,
+         handle_cast/2,
+         handle_info/2,
+         terminate/2,
+         code_change/3
+        ]).
+
+-export([get_pub_keys/0]).
+
+-type keys() :: #{exp_at := integer(), keys := list()}.
 
 %% ----------------------------------------------------------------------------
 %% External functions
@@ -43,19 +43,18 @@ start_link() ->
 -spec validate(binary()) -> {valid, map()} | {invalid, term()}.
 %% @doc Validates the ID token
 validate(IdToken) ->
-  [{certs, #{exp_at => Date, certs => Certs}}] = ets:lookup(google_token_cache, certs),
-  case Date > now_todo of
+  [{keys, #{exp_at := ExpAt, keys := Keys}}] =
+  case ExpAt > now_gregorian_seconds() of
     false ->
-      do_verify(IdToken, Certs);
+      do_verify(IdToken, Keys);
     true ->
-      ok = refresh_certs(),
-      [{certs, #{exp_at => RefreshedDate, certs => RefreshedCerts}}] =
-        ets:lookup(google_token_cache, certs),
-      do_verify(IdToken, RefreshedCerts),
+      #{keys := RefreshedKeys} = refresh_keys(),
+      do_verify(IdToken, RefreshedKeys),
       ok
   end.
 
-refresh_certs() ->
+-spec refresh_keys() -> keys().
+refresh_keys() ->
   gen_server:call(?MODULE, refresh).
 
 -spec validate(binary(), list()) -> {valid, map()} | {invalid, term()}.
@@ -69,24 +68,20 @@ validate(IdToken, ClientIds) ->
 
 %% @private
 init(_Args) ->
-  %%{state, State} = get_cert_state(),
   ets:new(google_token_cache, [set, public, named_table, {read_concurrency, true}]),
-  {ok, #{exp_at => 0}}.
+  InitialState = #{exp_at => 0, keys => []},
+  ets:insert(google_token_cache, InitialState),
+  {ok, InitialState}.
 
 %% @private
 handle_call(refresh, _From, #{exp_at := ExpAt} = State) ->
-  case ExpAt > now_todo of
-    true -> {reply, ok, State};
+  case ExpAt > now_gregorian_seconds() of
+    true -> {reply, State, State};
     false ->
-      CertsResponse = get_certs(), %% #{exp_at => Date, certs => Certs}
-      #{exp_at => ExpAt} = CertsResponse,
-      ets:insert(google_token_cache, Certs),
-      {reply, ok, #{exp_at => ExpAt}}
-  end.
-
-handle_call({verify_without_ids, IdToken}, _From, State) ->
-  Reply = do_verify(IdToken, State),
-  {reply, Reply, State};
+      NewState = get_pub_keys(),
+      ets:insert(google_token_cache, NewState),
+      {reply, NewState, NewState}
+  end;
 handle_call({verify_with_ids, [IdToken, ClientIds]}, _From, State) ->
   Reply = case do_verify(IdToken, State) of
     {valid, Payload} ->
@@ -118,16 +113,15 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %% ----------------------------------------------------------------------------
 
--spec do_verify(binary(), #state{}) -> {valid, map()} |
-                                       {invalid, term()} |
-                                       {error, term()}.
+-spec do_verify(binary(), [map()]) -> {valid, map()} |
+                                      {invalid, term()} |
+                                      {error, term()}.
 %% @private
 %% @doc Abstracts the JWT validation
-do_verify(IdToken, State) ->
+do_verify(IdToken, Keys) ->
   try get_kid(IdToken) of
     {kid, KId} ->
-      Keys = State#state.keys,
-      try_verify(IdToken, KId, State, Keys, false);
+      try_verify(IdToken, KId, Keys);
     {error, not_found} ->
       {invalid, malformed_token}
   catch
@@ -148,19 +142,7 @@ get_kid(IdToken) ->
       {error, not_found}
   end.
 
--spec try_verify(binary(), binary(), #state{}, list(), boolean()) ->
-                                                        {valid, map()} |
-                                                        {invalid, term()} |
-                                                        {error, term()}.
-%% @private
-%% @doc Performs error checking and key matching
-try_verify(IdToken, KId, _State, [], false) ->
-  {state, State} = get_cert_state(),
-  Keys = State#state.keys,
-  try_verify(IdToken, KId, State, Keys, true);
-try_verify(_IdToken, _KId, #state{error = Error}, [], true) ->
-  {error, Error};
-try_verify(IdToken, KId, State, Keys, Retried) ->
+try_verify(IdToken, KId, Keys) ->
   case find_key(KId, Keys) of
     {key, Key} ->
       validate_jwt(Key, IdToken);
@@ -244,30 +226,29 @@ find_key(KId, [Key | Keys], no_match) ->
   end,
   find_key(KId, Keys, Res).
 
--spec get_cert_state() -> {state, #state{}}.
-%% @private
-%% @doc Performs get_certs() and returns the state
-get_cert_state() ->
-  case get_certs() of
-    {keys, Keys} ->
-      {state, #state{keys = Keys}};
-    Error ->
-      {state, #state{error = Error}}
-  end.
-
--spec get_certs() -> {certs, list()}.
 %% @private
 %% @doc Gets the latest JWK from Google's certificate repository
-get_certs() ->
-  Url = "https://www.googleapis.com/oauth2/v3/certs",
-  case httpc:request(Url) of
-    {ok, {{_Version, 200, _Phrase}, _Headers, Body}} ->
-      BodyMap = jsx:decode(ensure_binary(Body), [return_maps]),
-      Keys    = maps:get(<<"keys">>, BodyMap, []),
-      {keys, Keys};
-    Error ->
-      {get_certs_error, Error}
+-spec get_pub_keys() -> keys().
+get_pub_keys() ->
+  Url = <<"https://www.googleapis.com/oauth2/v3/certs">>,
+  case hackney:request(get, Url, [], <<>>, [with_body]) of
+    {ok, 200, Headers, Body} ->
+      BodyMap = jsx:decode(Body, [return_maps]),
+      Keys = maps:get(<<"keys">>, BodyMap, []),
+      CacheControl = hackney_headers:parse(<<"Cache-Control">>, Headers),
+      {match, [MaxAgeBin]} = re:run(CacheControl,
+                                    <<"max-age=(\\d+)">>,
+                                    [{capture, all_but_first, binary}]),
+      MaxAge = binary_to_integer(MaxAgeBin),
+      #{exp_at => now_gregorian_seconds() + MaxAge, keys => Keys};
+    {ok, _, _, _} ->
+      {error, service_unavailable};
+    {error, Reason} ->
+      {error, Reason}
   end.
+
+now_gregorian_seconds() ->
+  calendar:datetime_to_gregorian_seconds(calendar:local_time()).
 
 -spec ensure_binary(term()) -> binary().
 %% @private
